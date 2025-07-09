@@ -1,5 +1,6 @@
 """Implement HuggingfaceModel models."""
 import copy
+from types import MethodType
 import logging
 from collections import Counter
 import torch
@@ -13,6 +14,7 @@ from transformers import BitsAndBytesConfig
 from transformers import StoppingCriteria
 from transformers import StoppingCriteriaList
 from huggingface_hub import snapshot_download
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 
 from uncertainty.models.base_model import BaseModel
@@ -82,13 +84,62 @@ def remove_split_layer(device_map_in):
     return device_map
 
 
+def steering_hook(module, inputs, output):
+    confabulation_vector = 100*torch.ones(1, 4096)
+    hidden = output.hidden_states[-1]  # (batch, seq_len, hidden_size)
+    hidden[:, -1, :] += confabulation_vector.to(hidden.device)
+    return output
+
+
+def monkeypatch_forward_with_steering(model, confabulation_vector=None):
+    """
+    Monkeypatches the model's forward method to inject a confabulation vector
+    into the last hidden layer before logits.
+    """
+
+    original_forward = model.forward  # keep original for internal use
+
+    def custom_forward(self, *args, **kwargs):
+        kwargs['output_hidden_states'] = True  # make sure we get hidden states
+
+        # Avoid double-passing input_ids
+        # If input_ids is passed both ways, remove one
+        if args:
+            # If positional args already include input_ids, remove from kwargs
+            kwargs.pop("input_ids", None)
+
+        outputs = original_forward(*args, **kwargs)
+
+        # outputs.hidden_states is a tuple: (layer_0, ..., layer_n)
+        last_hidden = outputs.hidden_states[-1]  # shape: (batch, seq_len, hidden_size)
+
+        if confabulation_vector is not None:
+            # Inject vector into last token of each sequence
+            last_hidden[:, -1, :] += confabulation_vector.to(last_hidden.device)
+
+        # Recompute logits using LM head
+        logits = model.lm_head(last_hidden)
+
+        # Return a full CausalLMOutputWithPast for compatibility
+        return CausalLMOutputWithPast(
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    # Bind correctly
+    model.forward = MethodType(custom_forward, model)
+
+
 class HuggingfaceModel(BaseModel):
     """Hugging Face Model."""
 
-    def __init__(self, model_name, stop_sequences=None, max_new_tokens=None):
+    def __init__(self, model_name, stop_sequences=None, max_new_tokens=None, confabulation_vector=None):
         if max_new_tokens is None:
             raise
         self.max_new_tokens = max_new_tokens
+        self.confabulation_vector = confabulation_vector
 
         if stop_sequences == 'default':
             stop_sequences = STOP_SEQUENCES
@@ -121,6 +172,9 @@ class HuggingfaceModel(BaseModel):
                 self.model = AutoModelForCausalLM.from_pretrained(
                     f"{base}/{model_name}", device_map="auto",
                     max_memory={0: '80GIB'}, **kwargs,)
+                self.model.register_forward_hook(steering_hook)
+                # monkeypatch_forward_with_steering(
+                #     model=self.model, confabulation_vector=confabulation_vector)  # MONKEYPATCH
 
             elif llama2_70b or llama65b:
                 path = snapshot_download(
