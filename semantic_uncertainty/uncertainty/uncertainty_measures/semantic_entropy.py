@@ -26,8 +26,17 @@ class BaseEntailment:
 class EntailmentDeberta(BaseEntailment):
     def __init__(self):
         self.tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v2-xlarge-mnli")
-        self.model = AutoModelForSequenceClassification.from_pretrained(
-            "microsoft/deberta-v2-xlarge-mnli").to(DEVICE)
+        model_id = "microsoft/deberta-v2-xlarge-mnli"
+        # Try to load with safetensors if available
+        try:
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_id, trust_remote_code=True, use_safetensors=True
+            ).to(DEVICE)
+        except Exception as e:
+            logging.warning(f"Could not load model with safetensors: {e}. Falling back to default loading.")
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_id
+            ).to(DEVICE)
 
     def check_implication(self, text1, text2, *args, **kwargs):
         inputs = self.tokenizer(text1, text2, return_tensors="pt").to(DEVICE)
